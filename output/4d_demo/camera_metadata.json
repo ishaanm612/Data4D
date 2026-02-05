@@ -1,0 +1,73 @@
+{
+  "cameras": [
+    {
+      "id": "cam0",
+      "type": "exo",
+      "intrinsics": {
+        "fx": 960.0000000000001,
+        "fy": 960.0000000000001,
+        "cx": 960.0,
+        "cy": 540.0,
+        "width": 1920,
+        "height": 1080,
+        "fov": 90
+      },
+      "initial_position": [
+        0,
+        0,
+        500
+      ],
+      "initial_rotation": [
+        -90,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cam1",
+      "type": "exo",
+      "intrinsics": {
+        "fx": 960.0000000000001,
+        "fy": 960.0000000000001,
+        "cx": 960.0,
+        "cy": 540.0,
+        "width": 1920,
+        "height": 1080,
+        "fov": 90
+      },
+      "initial_position": [
+        1000,
+        0,
+        200
+      ],
+      "initial_rotation": [
+        -20,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "cam_ego",
+      "type": "ego",
+      "intrinsics": {
+        "fx": 448.1328244542143,
+        "fy": 448.1328244542143,
+        "cx": 640.0,
+        "cy": 360.0,
+        "width": 1280,
+        "height": 720,
+        "fov": 110
+      },
+      "initial_position": [
+        0,
+        0,
+        170
+      ],
+      "initial_rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

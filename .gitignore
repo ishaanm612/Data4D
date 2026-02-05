@@ -2,3 +2,4 @@ __MACOSX/
 **/__pycache__/
 build/
 *.egg-info/
+**/demo_output_60fps/

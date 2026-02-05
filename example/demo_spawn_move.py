@@ -7,7 +7,7 @@ import numpy as np
 def demo_spawn_and_move():
     # Initialize the environment
     # using a simple environment ID from the examples
-    env_id = "UnrealTrack-Greek_Island-ContinuousColor-v0"
+    env_id = "UnrealAgent-Greek_Island-ContinuousColor-v0"
     env = gym.make(env_id)
     env.reset()
 
@@ -56,9 +56,8 @@ def demo_spawn_and_move():
 
     # Run a short loop to let it move
     for _ in range(20):
-        env.step(
-            env.action_space.sample()
-        )  # Step the environment to keep physics running
+        actions = [space.sample() for space in env.action_space]
+        env.step(actions)  # Step the environment to keep physics running
         # Optional: Print location to track movement
         # pos = unreal.get_obj_location(new_agent_name)
         # print(f"Current pos: {pos}")
@@ -74,7 +73,8 @@ def demo_spawn_and_move():
     unreal.nav_to_goal(new_agent_name, target_pos)
 
     for _ in range(50):
-        env.step(env.action_space.sample())
+        actions = [space.sample() for space in env.action_space]
+        env.step(actions)
         time.sleep(0.1)
 
     print("Demo complete.")
