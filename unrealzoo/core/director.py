@@ -9,7 +9,7 @@ class Director:
     and stochastic background movements.
     """
 
-    def __init__(self, unreal_client):
+    def __init__(self, unreal_client, nav_interval=3.0):
         self.client = unreal_client
         self.logger = logging.getLogger(__name__)
         self.scheduled_events = []  # List of dicts with {time, actor, type, params}
@@ -18,7 +18,7 @@ class Director:
 
         # Track last navigation command time for NavMesh
         self.last_nav_time = {}  # {actor_name: last_time}
-        self.nav_interval = 0.25  # Send new nav command every 0.25 second
+        self.nav_interval = nav_interval  # Seconds between nav_random; longer = smoother, less disjointed motion
 
     def register_background_actor(self, actor_name):
         """
@@ -105,7 +105,7 @@ class Director:
     def update_background_actors(self, dt):
         """
         Stochastic updates for background actors using NavMesh.
-        Sends nav_random commands periodically (every 2 seconds).
+        Sends nav_random commands periodically (nav_interval seconds).
         """
         for actor in self.background_actors:
             # Check if enough time has passed since last navigation command

@@ -5,7 +5,7 @@ import time
 import glob
 
 
-def replay_data(output_dir, fps=30):
+def replay_data(output_dir, fps=30, step_mode=False):
     if not os.path.exists(output_dir):
         print(f"Error: Directory {output_dir} not found.")
         return
@@ -55,9 +55,14 @@ def replay_data(output_dir, fps=30):
         print(f"\nNo valid views with 'rgb' images found in {session_path}")
         return
 
-    print(
-        f"\nReplaying {len(valid_views)} views... Press 'q' to quit, 'n' for next view."
-    )
+    if step_mode:
+        print(
+            f"\nStep mode: [Space]/d next frame, a prev frame, n next view, q quit."
+        )
+    else:
+        print(
+            f"\nReplaying {len(valid_views)} views... Press 'q' to quit, 'n' for next view."
+        )
 
     for view_name in valid_views:
         print(f"\nPlaying View: {view_name}")
@@ -68,7 +73,9 @@ def replay_data(output_dir, fps=30):
             print(f"  No images in {view_name}")
             continue
 
-        for img_path in images:
+        frame_idx = 0
+        while frame_idx < len(images):
+            img_path = images[frame_idx]
             frame = cv2.imread(img_path)
 
             # Overlay text
@@ -84,18 +91,30 @@ def replay_data(output_dir, fps=30):
             frame_num = os.path.basename(img_path).split(".")[0]
             cv2.putText(
                 frame,
-                f"Frame: {frame_num}",
+                f"Frame: {frame_num} ({frame_idx + 1}/{len(images)})",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 255, 0),
                 2,
             )
+            if step_mode:
+                cv2.putText(
+                    frame,
+                    "[Space]/d next | a prev | n view | q quit",
+                    (10, frame.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                (128, 128, 128),
+                1,
+                )
 
             cv2.imshow("UnrealZoo Replay", frame)
 
-            # Wait time based on FPS
-            wait_ms = int(1000 / fps)
+            if step_mode:
+                wait_ms = 0  # Wait indefinitely for keypress
+            else:
+                wait_ms = int(1000 / fps)
             key = cv2.waitKey(wait_ms) & 0xFF
 
             if key == ord("q"):
@@ -105,6 +124,13 @@ def replay_data(output_dir, fps=30):
             elif key == ord("n"):
                 print("Skipping to next view...")
                 break
+            elif step_mode:
+                if key in (ord(" "), ord("d"), 83):  # space, 'd', or right-arrow
+                    frame_idx += 1
+                elif key in (ord("a"), 81):  # 'a' or left-arrow
+                    frame_idx = max(0, frame_idx - 1)
+            else:
+                frame_idx += 1
 
         # Pause briefly between views
         time.sleep(0.5)
@@ -122,6 +148,11 @@ if __name__ == "__main__":
         help="Output directory to replay",
     )
     parser.add_argument("--fps", type=int, default=30, help="Playback FPS")
+    parser.add_argument(
+        "--step",
+        action="store_true",
+        help="Step through frames manually (Space/d=next, a=prev, n=view, q=quit)",
+    )
     args = parser.parse_args()
 
-    replay_data(args.dir, args.fps)
+    replay_data(args.dir, args.fps, step_mode=args.step)

@@ -160,7 +160,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
             f"{actor}_follow", actor, distance=300, pitch=-30, yaw=0
         )
 
-    # 4. Run Loop (30 Frames at 30 FPS)
+    # 4. Run Loop (600 Frames at 30 FPS)
     target_frames = 30
     dt = 1.0 / 30.0
 

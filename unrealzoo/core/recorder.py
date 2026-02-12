@@ -51,6 +51,7 @@ class MultiViewRecorder:
         self._follow_smoothing = (
             0.35  # 0=snap, 1=no movement; ~0.35 gives smooth tracking
         )
+        self._camera_settle_delay = 0.02  # Per-view: wait after positioning before capture
 
         # Create directory structure
         self._init_directories()
@@ -450,15 +451,12 @@ class MultiViewRecorder:
             "cameras": [],  # List of view ids; full metadata in each view's metadata/ subdir
         }
 
-        # Capture from all legacy views using their assigned camera IDs
+        # Single pass: for each view, update position (if dynamic), brief settle, then capture
         for view in self.views:
             view_dir = self.output_dir / view["id"]
             cam_id = view["cam_id"]
-            # if self.frame_idx == 0:
-            # print(f"    [{view['id']}]...", end=" ", flush=True)
 
             try:
-                # Update dynamic camera positions (POV and Follow cameras)
                 if view["type"] == "actor_pov":
                     # Get actor location and rotation for true POV (camera rotates with actor)
                     actor_id = view["actor_id"]
@@ -583,6 +581,14 @@ class MultiViewRecorder:
 
                 # Static cameras don't need position updates (set during add_static_view)
 
+                # Brief pause after positioning so Unreal applies transform before capture
+                if view["type"] in ("actor_pov", "actor_follow"):
+                    time.sleep(self._camera_settle_delay)
+
+            except Exception as e:
+                self.logger.warning(f"Failed to update camera for view {view['id']}: {e}")
+
+            try:
                 # Build frame metadata: intrinsics + extrinsics
                 cam_frame_meta = {}
                 width, height = self._capture_resolution
@@ -618,34 +624,22 @@ class MultiViewRecorder:
                     """Decode image data from UnrealCV (handles both bytes and base64)."""
                     if data is None or data == "error":
                         return None
-
                     try:
-                        # If data is already bytes (PNG format), decode directly
                         if isinstance(data, bytes):
                             nparr = np.frombuffer(data, np.uint8)
-                            mode = (
-                                cv2.IMREAD_COLOR if is_color else cv2.IMREAD_UNCHANGED
-                            )
+                            mode = cv2.IMREAD_COLOR if is_color else cv2.IMREAD_UNCHANGED
                             img = cv2.imdecode(nparr, mode)
                             return img
-
-                        # If data is a string, check if it's an error or base64
                         if isinstance(data, str):
-                            # Short strings are likely error messages
                             if len(data) < 100:
                                 return None
-
-                            # Try base64 decode for longer strings
                             img_bytes = base64.b64decode(data)
                             nparr = np.frombuffer(img_bytes, np.uint8)
-                            mode = (
-                                cv2.IMREAD_COLOR if is_color else cv2.IMREAD_UNCHANGED
-                            )
+                            mode = cv2.IMREAD_COLOR if is_color else cv2.IMREAD_UNCHANGED
                             img = cv2.imdecode(nparr, mode)
                             return img
-
                         return None
-                    except Exception as e:
+                    except Exception:
                         return None
 
                 # 1. Capture RGB
