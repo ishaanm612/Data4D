@@ -114,7 +114,7 @@ class Director:
                 >= self.nav_interval
             ):
                 # Send new navigation command
-                radius = 1000  # Random navigation radius
+                radius = 2500  # Random navigation radius
                 try:
                     if hasattr(self.client, "nav_random"):
                         self.client.nav_random(actor, radius, 0)  # loop=0 implies once

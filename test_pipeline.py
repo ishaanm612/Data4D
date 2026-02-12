@@ -3,6 +3,7 @@ import gym_unrealcv
 import time
 import os
 import numpy as np
+from gym_unrealcv.envs.wrappers import configUE
 from unrealzoo.core.director import Director
 from unrealzoo.core.recorder import MultiViewRecorder
 from unrealzoo.utils.ground_detection import load_safe_spawns, get_random_safe_spawn
@@ -14,13 +15,26 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
     NUM_STATIC_CAMERAS = 5
     ACTOR_SPREAD_RADIUS = 2000  # How far apart actors spawn
     CAMERA_OFFSET_RANGE = 500  # Random offset range for static cameras from actors
+    # Use 1280x720 to avoid reset hang; Full HD (1920x1080) can stall during init observation
+    WINDOW_RESOLUTION = (1280, 720)
     # =========================
 
     print(f"Initializing Env: {env_id}...")
     env = gym.make(env_id)
-    # DO NOT modify resolution - it causes env.reset() to hang
-    env.reset()
-    client = env.unwrapped.unrealcv
+    # sleep_time: wait for Unreal to start before connecting.
+    # first_obs_delay: wait before first image fetch (Unreal shader compile, etc.).
+    env = configUE.ConfigUEWrapper(
+        env,
+        offscreen=True,
+        resolution=WINDOW_RESOLUTION,
+        sleep_time=10,
+        first_obs_delay=3,
+    )
+    # Use ensure_launched() to skip initial observation fetch (avoids hang on first render).
+    # test_pipeline clears the scene and spawns its own agents, so the default obs isn't needed.
+    print("Launching env (connect only, no observation fetch)...")
+    client = env.unwrapped.ensure_launched()
+    print("Env ready.")
 
     # Generate unique session ID
     session_id = time.strftime("%Y%m%d_%H%M%S")
@@ -29,12 +43,19 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
     print(f"Saving data to: {session_dir}")
 
     # Init Components
+    print("Initializing Director and Recorder...")
     director = Director(client)
-    recorder = MultiViewRecorder(client, output_dir=session_dir)
+    # skip_depth=True: depth capture often hangs with UnrealCV; RGB/mask still captured
+    recorder = MultiViewRecorder(client, output_dir=session_dir, skip_depth=False)
 
-    # 1. Clear scene
-    print("Resetting scene...")
-    client.client.request("vset /action/clear")
+    # 1. Clear scene (removes default env agents so we can spawn our own)
+    print("Resetting scene (vset /action/clear)...")
+    try:
+        client.client.request("vset /action/clear")
+        print("  Scene clear done. Waiting 2s for Unreal to settle...")
+        time.sleep(2.0)
+    except Exception as e:
+        print(f"  Warning: scene clear failed ({e}). Continuing...")
 
     # Load safe spawn points
     print("Loading safe spawn points from safe_spawns.json...")
@@ -52,9 +73,14 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
         x, y, z = spawn_point["x"], spawn_point["y"], spawn_point["z"]
 
         actor_name = f"Walker_{i+1}"
-        client.new_obj("bp_character_C", actor_name, [x, y, z], [0, 0, 0])
-        spawned.append(actor_name)
-        print(f"  {actor_name} spawned at ({x:.0f}, {y:.0f}, {z:.0f})")
+        print(f"  Spawning {actor_name}...", end=" ", flush=True)
+        try:
+            client.new_obj("bp_character_C", actor_name, [x, y, z], [0, 0, 0])
+            spawned.append(actor_name)
+            print(f"done at ({x:.0f}, {y:.0f}, {z:.0f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            raise
 
     print(f"✓ Spawned {len(spawned)} agents at safe locations")
 
@@ -82,7 +108,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
 
     # 3. Setup Cameras
     print("Setting up Virtual Views...")
-    recorder.set_resolution(1280, 720)
+    recorder.set_resolution(WINDOW_RESOLUTION[0], WINDOW_RESOLUTION[1])
 
     # Static Cameras - use safe spawn points with elevated Z
     print(f"Creating {NUM_STATIC_CAMERAS} static cameras...")
@@ -125,33 +151,49 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
         )
 
     # Per-Actor Views (POV + Follow)
+    # offset_loc=[forward, right, up] in actor local frame; 80 forward to avoid head clipping
     for actor in spawned:
         recorder.add_actor_pov_view(
-            f"{actor}_pov", actor, offset_loc=[20, 0, 80], offset_rot=[0, 0, 0]
+            f"{actor}_pov", actor, offset_loc=[80, 0, 80], offset_rot=[0, 0, 0]
         )
         recorder.add_actor_follow_view(
             f"{actor}_follow", actor, distance=300, pitch=-30, yaw=0
         )
 
-    # 4. Run Loop (60 Frames at 30 FPS)
-    target_frames = 60
+    # 4. Run Loop (30 Frames at 30 FPS)
+    target_frames = 30
     dt = 1.0 / 30.0
 
     print(f"Starting Recording for {target_frames} frames at 30 FPS...")
+    session_start = time.time()
 
     for i in range(target_frames):
-        if i % 10 == 0:
-            print(f"Frame {i}/{target_frames}")
+        frame_start = time.time()
+        print(f"  Frame {i + 1}/{target_frames}: director.step...", end=" ", flush=True)
 
-        # Step Director (sends NavMesh commands periodically)
+        # Step Director and let sim advance BEFORE capture (so actors actually move)
         director.step(dt)
-
-        # Capture Frame from all views
-        recorder.capture_frame()
-
+        print("resume...", end=" ", flush=True)
+        client.client.request("vset /action/game/resume")
         time.sleep(dt)
 
-    print(f"Recording Complete! Data saved to: {session_dir}")
+        # Pause sim for consistent multi-camera capture
+        print("pause...", end=" ", flush=True)
+        client.client.request("vset /action/game/pause")
+
+        # Capture Frame from all views (sim frozen)
+        print("capture...", end=" ", flush=True)
+        recorder.capture_frame()
+        capture_elapsed = time.time() - frame_start
+
+        total_elapsed = time.time() - session_start
+        pct = 100 * (i + 1) / target_frames
+        print(f"done | capture: {capture_elapsed:.1f}s | total: {total_elapsed:.1f}s")
+
+    total_time = time.time() - session_start
+    print(
+        f"Recording Complete! {target_frames} frames in {total_time:.1f}s | Data saved to: {session_dir}"
+    )
     env.close()
 
 

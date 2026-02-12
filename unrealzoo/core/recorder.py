@@ -14,11 +14,14 @@ class MultiViewRecorder:
     RGB, depth, optical flow, segmentation masks, camera intrinsics/extrinsics.
     """
 
-    def __init__(self, unreal_client, output_dir, camera_configs=None):
+    def __init__(
+        self, unreal_client, output_dir, camera_configs=None, skip_depth=False
+    ):
         """
         Args:
             unreal_client: UnrealCV API client
             output_dir: Root directory for saving recordings
+            skip_depth: If True, skip depth capture (avoids hangs on some UnrealCV setups)
             camera_configs: Optional list of dicts with camera specs (for new API):
                 [{
                     'id': 'cam0',
@@ -34,12 +37,20 @@ class MultiViewRecorder:
         self.output_dir = Path(output_dir)
         self.camera_configs = camera_configs if camera_configs is not None else []
         self.frame_idx = 0
+        self.skip_depth = skip_depth
 
         # Initialize logger early
         self.logger = logging.getLogger(__name__)
 
         # Legacy API support
         self.views = []  # For dynamically added views
+        self._capture_resolution = (1280, 720)  # Default; updated by set_resolution
+        self._default_fov = 90  # Used for intrinsics when FOV not available
+        self._legacy_metadata_saved = False
+        self._last_follow_state = {}  # {view_id: (x, y, z, pitch, yaw)} for smoothing
+        self._follow_smoothing = (
+            0.35  # 0=snap, 1=no movement; ~0.35 gives smooth tracking
+        )
 
         # Create directory structure
         self._init_directories()
@@ -56,6 +67,7 @@ class MultiViewRecorder:
             width: Resolution width
             height: Resolution height
         """
+        self._capture_resolution = (width, height)
         self.logger.info(f"Setting resolution to {width}x{height}")
         result = self.unreal.client.request(f"vset /camera/0/size {width} {height}")
         self.logger.info(f"Resolution set result: {result}")
@@ -113,6 +125,42 @@ class MultiViewRecorder:
             json.dump(metadata, f, indent=2)
 
         self.logger.info(f"Saved camera metadata to {meta_path}")
+
+    def _save_legacy_camera_metadata(self):
+        """
+        Save camera intrinsics for all legacy views.
+        Called once on first frame capture.
+        """
+        if self._legacy_metadata_saved or not self.views:
+            return
+        width, height = self._capture_resolution
+        fov = self._default_fov
+        fx = fy = (width / 2.0) / np.tan(np.deg2rad(fov / 2.0))
+        cx, cy = width / 2.0, height / 2.0
+        metadata = {"cameras": []}
+        for view in self.views:
+            intrinsics = {
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+                "width": width,
+                "height": height,
+                "fov": fov,
+            }
+            cam_meta = {
+                "id": view["id"],
+                "type": view["type"],
+                "intrinsics": intrinsics,
+                "initial_position": view.get("location", [0, 0, 0]),
+                "initial_rotation": view.get("rotation", [0, 0, 0]),
+            }
+            metadata["cameras"].append(cam_meta)
+        meta_path = self.output_dir / "camera_metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        self._legacy_metadata_saved = True
+        self.logger.info(f"Saved legacy camera metadata to {meta_path}")
 
     def setup_cameras(self):
         """Position all cameras according to their configurations."""
@@ -243,11 +291,53 @@ class MultiViewRecorder:
     def reset(self):
         """Reset frame counter for a new recording session."""
         self.frame_idx = 0
+        self._last_follow_state = {}
         self.logger.info("Recorder reset")
 
     # =================================================================
     # Legacy API for backward compatibility with test_pipeline.py
     # =================================================================
+
+    def _spawn_virtual_camera(self):
+        """
+        Spawn a new virtual camera and return its ID.
+
+        Requires UnrealCV v0.4.0+ with multi-camera support.
+        The new camera is assigned the next sequential ID.
+        """
+        num_before = 0
+        if hasattr(self.unreal, "get_camera_num"):
+            num_before = self.unreal.get_camera_num()
+        else:
+            cameras_resp = self.unreal.client.request("vget /cameras")
+            if cameras_resp and cameras_resp != "error":
+                try:
+                    cameras = json.loads(cameras_resp)
+                    num_before = (
+                        len(cameras) if isinstance(cameras, list) else int(cameras_resp)
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    num_before = 0
+
+        self.unreal.client.request("vset /cameras/spawn")
+
+        if hasattr(self.unreal, "get_camera_num"):
+            cam_id = self.unreal.get_camera_num() - 1
+        else:
+            cameras_resp = self.unreal.client.request("vget /cameras")
+            if cameras_resp and cameras_resp != "error":
+                try:
+                    cameras = json.loads(cameras_resp)
+                    cam_id = (
+                        len(cameras) - 1 if isinstance(cameras, list) else num_before
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    cam_id = num_before
+            else:
+                cam_id = num_before
+
+        self.logger.debug(f"Spawned virtual camera, cam_id={cam_id}")
+        return cam_id
 
     def add_static_view(self, view_id, location, rotation):
         """
@@ -258,8 +348,7 @@ class MultiViewRecorder:
             location: [x, y, z] camera position
             rotation: [pitch, yaw, roll] camera rotation
         """
-        # Assign a unique camera ID for this view (start from 1, skip 0 which is viewport)
-        cam_id = len(self.views) + 1
+        cam_id = self._spawn_virtual_camera()
 
         view = {
             "id": view_id,
@@ -297,7 +386,7 @@ class MultiViewRecorder:
             offset_loc: [x, y, z] offset from actor location
             offset_rot: [pitch, yaw, roll] rotation offset
         """
-        cam_id = len(self.views) + 1
+        cam_id = self._spawn_virtual_camera()
 
         view = {
             "id": view_id,
@@ -325,7 +414,7 @@ class MultiViewRecorder:
             pitch: Camera pitch angle
             yaw: Camera yaw offset
         """
-        cam_id = len(self.views) + 1
+        cam_id = self._spawn_virtual_camera()
 
         view = {
             "id": view_id,
@@ -348,30 +437,66 @@ class MultiViewRecorder:
         Capture a single frame from all views (legacy API).
 
         Uses virtual cameras (cam_id 1+) to avoid moving the viewport camera (cam_id 0).
+        Saves intrinsics (camera_metadata.json) on first frame and extrinsics per frame.
         """
         import cv2
+
+        # Save camera intrinsics metadata once
+        self._save_legacy_camera_metadata()
+
+        frame_meta = {
+            "frame_idx": self.frame_idx,
+            "timestamp": time.time(),
+            "cameras": [],  # List of view ids; full metadata in each view's metadata/ subdir
+        }
 
         # Capture from all legacy views using their assigned camera IDs
         for view in self.views:
             view_dir = self.output_dir / view["id"]
             cam_id = view["cam_id"]
+            # if self.frame_idx == 0:
+            # print(f"    [{view['id']}]...", end=" ", flush=True)
 
             try:
                 # Update dynamic camera positions (POV and Follow cameras)
                 if view["type"] == "actor_pov":
-                    # Get actor location directly using UnrealCV command
-                    # This works for both registered and safe-spawn actors
+                    # Get actor location and rotation for true POV (camera rotates with actor)
                     actor_id = view["actor_id"]
                     loc_str = self.unreal.client.request(
                         f"vget /object/{actor_id}/location"
                     )
+                    rot_str = self.unreal.client.request(
+                        f"vget /object/{actor_id}/rotation"
+                    )
 
                     if loc_str and loc_str != "error":
                         try:
+                            import math
+
                             actor_loc = [float(x) for x in loc_str.split()]
-                            offset = view["offset_loc"]
-                            loc = [actor_loc[i] + offset[i] for i in range(3)]
-                            rot = view["offset_rot"]
+                            offset_loc = view["offset_loc"]  # [forward, right, up] in actor local frame
+                            offset_rot = view["offset_rot"]
+                            # Position: apply offset in actor's local frame so camera stays in front of face (avoids head clipping)
+                            if rot_str and rot_str != "error":
+                                actor_rot = [float(x) for x in rot_str.split()]
+                                yaw_rad = math.radians(actor_rot[1])
+                                fwd_x = math.cos(yaw_rad)
+                                fwd_y = math.sin(yaw_rad)
+                                loc = [
+                                    actor_loc[0]
+                                    + offset_loc[0] * fwd_x
+                                    - offset_loc[1] * math.sin(yaw_rad),
+                                    actor_loc[1]
+                                    + offset_loc[0] * fwd_y
+                                    + offset_loc[1] * math.cos(yaw_rad),
+                                    actor_loc[2] + offset_loc[2],
+                                ]
+                                rot = [
+                                    actor_rot[i] + offset_rot[i] for i in range(3)
+                                ]
+                            else:
+                                loc = [actor_loc[i] + offset_loc[i] for i in range(3)]
+                                rot = offset_rot
                             self.unreal.client.request(
                                 f"vset /camera/{cam_id}/location {loc[0]} {loc[1]} {loc[2]}"
                             )
@@ -403,24 +528,50 @@ class MultiViewRecorder:
                         and rot_str != "error"
                     ):
                         try:
+                            import math
+
                             actor_loc = [float(x) for x in loc_str.split()]
                             actor_rot = [float(x) for x in rot_str.split()]
 
-                            # Calculate follow position
-                            import math
-
+                            # Target follow position (behind actor based on yaw)
                             yaw_rad = math.radians(actor_rot[1] + view["yaw"])
                             distance = view["distance"]
+                            target_x = actor_loc[0] - distance * math.cos(yaw_rad)
+                            target_y = actor_loc[1] - distance * math.sin(yaw_rad)
+                            target_z = actor_loc[2] + 100  # Slight elevation
+                            target_yaw = actor_rot[1] + view["yaw"]
 
-                            cam_x = actor_loc[0] - distance * math.cos(yaw_rad)
-                            cam_y = actor_loc[1] - distance * math.sin(yaw_rad)
-                            cam_z = actor_loc[2] + 100  # Slight elevation
+                            # Smooth camera movement to avoid jumping when actor turns
+                            view_id = view["id"]
+                            t = self._follow_smoothing
+                            if view_id in self._last_follow_state:
+                                prev_x, prev_y, prev_z, prev_yaw = (
+                                    self._last_follow_state[view_id]
+                                )
+                                cam_x = prev_x + t * (target_x - prev_x)
+                                cam_y = prev_y + t * (target_y - prev_y)
+                                cam_z = prev_z + t * (target_z - prev_z)
+                                # Lerp yaw via shortest path
+                                delta = (target_yaw - prev_yaw) % 360
+                                if delta > 180:
+                                    delta -= 360
+                                cam_yaw = prev_yaw + t * delta
+                            else:
+                                cam_x, cam_y, cam_z = target_x, target_y, target_z
+                                cam_yaw = target_yaw
+
+                            self._last_follow_state[view_id] = (
+                                cam_x,
+                                cam_y,
+                                cam_z,
+                                cam_yaw,
+                            )
 
                             self.unreal.client.request(
                                 f"vset /camera/{cam_id}/location {cam_x} {cam_y} {cam_z}"
                             )
                             self.unreal.client.request(
-                                f"vset /camera/{cam_id}/rotation {view['pitch']} {actor_rot[1] + view['yaw']} 0"
+                                f"vset /camera/{cam_id}/rotation {view['pitch']} {cam_yaw} 0"
                             )
                         except (ValueError, IndexError) as e:
                             if self.frame_idx == 0:
@@ -432,9 +583,36 @@ class MultiViewRecorder:
 
                 # Static cameras don't need position updates (set during add_static_view)
 
+                # Build frame metadata: intrinsics + extrinsics
+                cam_frame_meta = {}
+                width, height = self._capture_resolution
+                fov = self._default_fov
+                fx = fy = (width / 2.0) / np.tan(np.deg2rad(fov / 2.0))
+                cx, cy = width / 2.0, height / 2.0
+                cam_frame_meta["intrinsics"] = {
+                    "fx": float(fx),
+                    "fy": float(fy),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "width": width,
+                    "height": height,
+                    "fov": fov,
+                }
+                loc_str = self.unreal.client.request(f"vget /camera/{cam_id}/location")
+                rot_str = self.unreal.client.request(f"vget /camera/{cam_id}/rotation")
+                if loc_str and loc_str != "error" and rot_str and rot_str != "error":
+                    try:
+                        position = [float(x) for x in loc_str.split()]
+                        rotation = [float(x) for x in rot_str.split()]
+                        cam_frame_meta["extrinsics"] = {
+                            "position": position,
+                            "rotation": rotation,
+                        }
+                    except (ValueError, IndexError):
+                        pass
+
                 # Capture Modalities: RGB, Depth, Mask
                 import base64
-                import numpy as np
 
                 def decode_capture(data, is_color=True):
                     """Decode image data from UnrealCV (handles both bytes and base64)."""
@@ -476,13 +654,15 @@ class MultiViewRecorder:
                 if img is not None:
                     rgb_path = view_dir / "rgb" / f"frame_{self.frame_idx:06d}.png"
                     cv2.imwrite(str(rgb_path), img)
-                    if self.frame_idx == 0:  # Only log first frame
-                        print(f"✓ [{view['id']}] Captured RGB {img.shape}")
+                    cam_frame_meta["rgb"] = str(rgb_path.relative_to(self.output_dir))
 
                 # 2. Capture Depth (use npy format)
-                depth_data = self.unreal.client.request(
-                    f"vget /camera/{cam_id}/depth npy"
-                )
+                if self.skip_depth:
+                    depth_data = None
+                else:
+                    depth_data = self.unreal.client.request(
+                        f"vget /camera/{cam_id}/depth npy"
+                    )
                 # Check for error response - handle both bytes and string types
                 is_error = False
                 if depth_data is None:
@@ -495,26 +675,39 @@ class MultiViewRecorder:
                 if depth_data and not is_error:
                     try:
                         import base64
-                        import numpy as np
 
-                        # Depth returns base64-encoded npy data
-                        depth_bytes = base64.b64decode(depth_data)
-                        depth_array = np.load(
-                            io.BytesIO(depth_bytes), allow_pickle=True
+                        # UnrealCV returns raw float32 bytes (not .npy pickle)
+                        if isinstance(depth_data, str):
+                            depth_bytes = base64.b64decode(depth_data)
+                        else:
+                            depth_bytes = (
+                                bytes(depth_data)
+                                if hasattr(depth_data, "__len__")
+                                else depth_data
+                            )
+                        depth_flat = np.frombuffer(depth_bytes, dtype=np.float32)
+                        n_total = len(depth_flat)
+                        h_exp, w_exp = (
+                            self._capture_resolution[1],
+                            self._capture_resolution[0],
                         )
+                        n_exp = h_exp * w_exp
+                        if n_total >= n_exp:
+                            depth_array = depth_flat[-n_exp:].reshape(h_exp, w_exp, 1)
+                        else:
+                            # Virtual cameras may use env default (e.g. 160x160); infer dims
+                            n_px = int(np.sqrt(n_total)) ** 2
+                            side = int(np.sqrt(n_px))
+                            depth_array = depth_flat[-n_px:].reshape(side, side, 1)
                         depth_path = (
                             view_dir / "depth" / f"frame_{self.frame_idx:06d}.npy"
                         )
                         np.save(str(depth_path), depth_array)
-                        if self.frame_idx == 0:
-                            print(
-                                f"✓ [{view['id']}] Captured Depth {depth_array.shape}"
-                            )
-                    except Exception as e:
-                        if self.frame_idx == 0:
-                            print(f"✗ [{view['id']}] Depth decode error: {e}")
-                elif self.frame_idx == 0:
-                    print(f"✗ [{view['id']}] Depth error: {depth_data}")
+                        cam_frame_meta["depth"] = str(
+                            depth_path.relative_to(self.output_dir)
+                        )
+                    except Exception:
+                        pass
 
                 # 3. Capture Mask
                 mask_data = self.unreal.client.request(
@@ -524,8 +717,28 @@ class MultiViewRecorder:
                 if mask_img is not None:
                     mask_path = view_dir / "mask" / f"frame_{self.frame_idx:06d}.png"
                     cv2.imwrite(str(mask_path), mask_img)
+                    cam_frame_meta["mask"] = str(mask_path.relative_to(self.output_dir))
+
+                # Save per-camera metadata (intrinsics, extrinsics, paths) to view's metadata subdir
+                cam_meta_dir = view_dir / "metadata"
+                cam_meta_dir.mkdir(parents=True, exist_ok=True)
+                cam_meta_path = cam_meta_dir / f"frame_{self.frame_idx:06d}.json"
+                cam_frame_meta["frame_idx"] = self.frame_idx
+                cam_frame_meta["timestamp"] = frame_meta["timestamp"]
+                with open(cam_meta_path, "w") as f:
+                    json.dump(cam_frame_meta, f, indent=2)
+
+                frame_meta["cameras"].append(view["id"])
 
             except Exception as e:
                 self.logger.warning(f"Failed to capture from view {view['id']}: {e}")
+
+        # Save scene-level frame index (frame_idx, timestamp, camera list)
+        frame_meta_path = (
+            self.output_dir / "scene_metadata" / f"frame_{self.frame_idx:06d}.json"
+        )
+        frame_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(frame_meta_path, "w") as f:
+            json.dump(frame_meta, f, indent=2)
 
         self.frame_idx += 1

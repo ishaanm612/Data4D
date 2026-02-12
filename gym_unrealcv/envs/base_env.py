@@ -90,6 +90,7 @@ class UnrealCv_base(gym.Env):
         self.nullrhi = False
         self.gpu_id = None  # None means using the default gpu
         self.sleep_time = 5
+        self.first_obs_delay = 5  # seconds to wait before first image fetch (Unreal shader compile, etc.)
         self.launched = False
         self.comm_mode = "tcp"
 
@@ -213,6 +214,22 @@ class UnrealCv_base(gym.Env):
 
         return observations, info["Reward"], info["Done"], info
 
+    def ensure_launched(self):
+        """
+        Launch Unreal and connect, without fetching initial observation.
+        Use for pipelines (e.g. test_pipeline) that clear the scene and spawn
+        their own agents — avoids hanging on the first image fetch.
+        Returns:
+            The UnrealCV client (Character_API instance).
+        """
+        if not self.launched:
+            self.launched = self.launch_ue_env()
+            print("  init_agents...", flush=True)
+            self.init_agents()
+            print("  init_objects...", flush=True)
+            self.init_objects()
+        return self.unrealcv
+
     def reset(self):
         """
         Reset the environment to its initial state.
@@ -222,7 +239,10 @@ class UnrealCv_base(gym.Env):
         """
         if not self.launched:  # first time to launch
             self.launched = self.launch_ue_env()
+            self._first_obs = True  # delay before first image fetch
+            print("  init_agents...", flush=True)
             self.init_agents()
+            print("  init_objects...", flush=True)
             self.init_objects()
 
         self.count_close = 0
@@ -242,7 +262,9 @@ class UnrealCv_base(gym.Env):
                 self.unrealcv.set_phy(obj, 1)
 
         # reset target location
+        print("  sample_init_pose...", flush=True)
         init_poses = self.sample_init_pose(self.random_init, len(self.player_list))
+        print("  set_obj_location + set_cam...", flush=True)
         for i, obj in enumerate(self.player_list):
             self.unrealcv.set_obj_location(obj, init_poses[i])
             # set view point
@@ -253,11 +275,20 @@ class UnrealCv_base(gym.Env):
             )
 
         # 匹配真正cam
+        print("  get_camera_config + update_camera_assignments...", flush=True)
         self.unrealcv.cam = self.unrealcv.get_camera_config()
         self.update_camera_assignments()
         # set global view to the top location
+        print("  set_topview...", flush=True)
         self.set_topview(init_poses[self.protagonist_id], self.cam_id[0])
         # get state
+        print("  update_observation (fetching initial images)...", flush=True)
+        # On first launch, Unreal needs extra time before first render (shaders, etc.)
+        if getattr(self, "_first_obs", True):
+            delay = getattr(self, "first_obs_delay", 5)
+            print(f"  Waiting {delay}s for Unreal to prepare first render...", flush=True)
+            time.sleep(delay)
+            self._first_obs = False
         observations, self.obj_poses, self.img_show = self.update_observation(
             self.player_list, self.cam_list, self.cam_flag, self.observation_type
         )
@@ -512,13 +543,20 @@ class UnrealCv_base(gym.Env):
         self.observation_space.pop(agent_index)
         self.unrealcv.destroy_obj(name)  # the agent is removed from the scene
         self.agents.pop(name)
-        st_time = time.time()
         time.sleep(1)
         print(f"waiting for remove agent {name}...")
+        st_time = time.time()
+        timeout = 15  # Avoid infinite hang if camera count never drops (UE5 may differ from UE4)
         while (
             self.unrealcv.get_camera_num() > len(last_cam_list) + 1
         ):  # UE4 需要+1 ,UE5 不用?
-            pass
+            if time.time() - st_time > timeout:
+                print(
+                    f"  Timeout waiting for camera cleanup after {name}. "
+                    "Continuing (get_camera_num may differ on UE5)."
+                )
+                break
+            time.sleep(0.2)
         print("Remove finished!")
 
     def remove_cam(self, name):
@@ -751,7 +789,7 @@ class UnrealCv_base(gym.Env):
             opengl=self.use_opengl,
             offscreen=self.offscreen_rendering,
             nullrhi=self.nullrhi,
-            sleep_time=5,
+            sleep_time=self.sleep_time,
         )
 
         # connect to UnrealCV Server
@@ -881,7 +919,6 @@ class UnrealCv_base(gym.Env):
             or use_depth
             or observation_type == "MaskDepth"
         )
-        print("cam_flag:", flag)
         return flag
 
     def sample_from_area(self, area, num):
@@ -925,7 +962,6 @@ class UnrealCv_base(gym.Env):
         # 获取所有相机位置
         cam_locs = []
         for cam_id in range(0, self.unrealcv.get_camera_num()):
-            print(cam_id)
             cam_loc = self.unrealcv.get_cam_location(cam_id)
             cam_locs.append(cam_loc)
 
