@@ -47,6 +47,8 @@ class MultiViewRecorder:
         self._capture_resolution = (1280, 720)  # Default; updated by set_resolution
         self._default_fov = 90  # Used for intrinsics when FOV not available
         self._legacy_metadata_saved = False
+        self._last_pov_rot = {}  # {view_id: (pitch, yaw, roll)} for head-locked smooth rotation
+        self._pov_smoothing = 0.25  # Lower = smoother, higher = more responsive
         self._last_follow_state = {}  # {view_id: (x, y, z, pitch, yaw)} for smoothing
         self._follow_smoothing = (
             0.35  # 0=snap, 1=no movement; ~0.35 gives smooth tracking
@@ -292,6 +294,7 @@ class MultiViewRecorder:
     def reset(self):
         """Reset frame counter for a new recording session."""
         self.frame_idx = 0
+        self._last_pov_rot = {}
         self._last_follow_state = {}
         self.logger.info("Recorder reset")
 
@@ -495,6 +498,33 @@ class MultiViewRecorder:
                             else:
                                 loc = [actor_loc[i] + offset_loc[i] for i in range(3)]
                                 rot = offset_rot
+
+                            # Keep POV camera locked to head position, but smooth rotation
+                            view_id = view["id"]
+                            target_pitch, target_yaw, target_roll = rot
+                            t = self._pov_smoothing
+                            if view_id in self._last_pov_rot:
+                                prev_pitch, prev_yaw, prev_roll = self._last_pov_rot[
+                                    view_id
+                                ]
+                                cam_pitch = prev_pitch + t * (target_pitch - prev_pitch)
+
+                                delta_yaw = (target_yaw - prev_yaw) % 360
+                                if delta_yaw > 180:
+                                    delta_yaw -= 360
+                                cam_yaw = prev_yaw + t * delta_yaw
+
+                                delta_roll = (target_roll - prev_roll) % 360
+                                if delta_roll > 180:
+                                    delta_roll -= 360
+                                cam_roll = prev_roll + t * delta_roll
+
+                                rot = [cam_pitch, cam_yaw, cam_roll]
+                            else:
+                                rot = [target_pitch, target_yaw, target_roll]
+
+                            self._last_pov_rot[view_id] = (rot[0], rot[1], rot[2])
+
                             self.unreal.client.request(
                                 f"vset /camera/{cam_id}/location {loc[0]} {loc[1]} {loc[2]}"
                             )

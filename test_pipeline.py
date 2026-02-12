@@ -161,7 +161,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
         )
 
     # 4. Run Loop (600 Frames at 30 FPS)
-    target_frames = 30
+    target_frames = 150
     dt = 1.0 / 30.0
 
     print(f"Starting Recording for {target_frames} frames at 30 FPS...")

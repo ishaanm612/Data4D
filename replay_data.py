@@ -3,6 +3,7 @@ import os
 import argparse
 import time
 import glob
+import numpy as np
 
 
 def replay_data(output_dir, fps=30, step_mode=False):
@@ -66,50 +67,46 @@ def replay_data(output_dir, fps=30, step_mode=False):
 
     for view_name in valid_views:
         print(f"\nPlaying View: {view_name}")
-        image_folder = os.path.join(session_path, view_name, "rgb")
-        images = sorted(glob.glob(os.path.join(image_folder, "*.png")))
+        rgb_dir = os.path.join(session_path, view_name, "rgb")
+        mask_dir = os.path.join(session_path, view_name, "mask")
+        depth_dir = os.path.join(session_path, view_name, "depth")
+        images = sorted(glob.glob(os.path.join(rgb_dir, "*.png")))
 
         if not images:
             print(f"  No images in {view_name}")
             continue
 
+        frame_stems = [os.path.splitext(os.path.basename(p))[0] for p in images]
+
         frame_idx = 0
         while frame_idx < len(images):
-            img_path = images[frame_idx]
-            frame = cv2.imread(img_path)
+            frame_stem = frame_stems[frame_idx]
+            rgb = cv2.imread(images[frame_idx], cv2.IMREAD_COLOR)
+            if rgb is None:
+                rgb = np.zeros((360, 640, 3), dtype=np.uint8)
 
-            # Overlay text
-            cv2.putText(
-                frame,
-                f"View: {view_name}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2,
-            )
-            frame_num = os.path.basename(img_path).split(".")[0]
-            cv2.putText(
-                frame,
-                f"Frame: {frame_num} ({frame_idx + 1}/{len(images)})",
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2,
-            )
-            if step_mode:
-                cv2.putText(
-                    frame,
-                    "[Space]/d next | a prev | n view | q quit",
-                    (10, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                (128, 128, 128),
-                1,
-                )
+            panel_w = min(640, rgb.shape[1])
+            scale = panel_w / float(max(1, rgb.shape[1]))
+            panel_h = max(180, int(rgb.shape[0] * scale))
+            panel_size = (panel_w, panel_h)  # (w, h)
 
-            cv2.imshow("UnrealZoo Replay", frame)
+            rgb_panel = _prepare_panel(rgb, panel_size, "RGB")
+            mask_panel = _load_mask_panel(mask_dir, frame_stem, panel_size)
+            depth_panel = _load_depth_panel(depth_dir, frame_stem, panel_size)
+            info_panel = _build_info_panel(
+                panel_size,
+                view_name=view_name,
+                frame_stem=frame_stem,
+                frame_idx=frame_idx,
+                total_frames=len(images),
+                step_mode=step_mode,
+            )
+
+            top_row = np.hstack([rgb_panel, mask_panel])
+            bottom_row = np.hstack([depth_panel, info_panel])
+            canvas = np.vstack([top_row, bottom_row])
+
+            cv2.imshow("UnrealZoo Replay", canvas)
 
             if step_mode:
                 wait_ms = 0  # Wait indefinitely for keypress
@@ -137,6 +134,138 @@ def replay_data(output_dir, fps=30, step_mode=False):
 
     cv2.destroyAllWindows()
     print("\nReplay finished.")
+
+
+def _prepare_panel(image, panel_size, title):
+    panel = cv2.resize(image, panel_size, interpolation=cv2.INTER_LINEAR)
+    cv2.putText(
+        panel,
+        title,
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+    )
+    return panel
+
+
+def _load_mask_panel(mask_dir, frame_stem, panel_size):
+    mask_path = os.path.join(mask_dir, f"{frame_stem}.png")
+    if not os.path.exists(mask_path):
+        return _empty_panel(panel_size, "MASK (missing)")
+
+    mask = cv2.imread(mask_path, cv2.IMREAD_COLOR)
+    if mask is None:
+        return _empty_panel(panel_size, "MASK (unreadable)")
+    return _prepare_panel(mask, panel_size, "MASK")
+
+
+def _load_depth_panel(depth_dir, frame_stem, panel_size):
+    npy_path = os.path.join(depth_dir, f"{frame_stem}.npy")
+    png_path = os.path.join(depth_dir, f"{frame_stem}.png")
+
+    depth_vis = None
+    if os.path.exists(npy_path):
+        try:
+            depth = np.load(npy_path, allow_pickle=False)
+            depth = np.squeeze(depth)
+            if depth.ndim != 2:
+                return _empty_panel(panel_size, "DEPTH (shape err)")
+            depth_vis = _depth_to_colormap(depth)
+        except Exception:
+            return _empty_panel(panel_size, "DEPTH (read err)")
+    elif os.path.exists(png_path):
+        depth_png = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
+        if depth_png is None:
+            return _empty_panel(panel_size, "DEPTH (read err)")
+        if depth_png.ndim == 2:
+            depth_vis = cv2.applyColorMap(
+                cv2.normalize(depth_png, None, 0, 255, cv2.NORM_MINMAX).astype(
+                    np.uint8
+                ),
+                cv2.COLORMAP_INFERNO,
+            )
+        else:
+            depth_vis = depth_png
+    else:
+        return _empty_panel(panel_size, "DEPTH (missing)")
+
+    return _prepare_panel(depth_vis, panel_size, "DEPTH")
+
+
+def _depth_to_colormap(depth):
+    finite = np.isfinite(depth)
+    if not finite.any():
+        return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+    valid = depth[finite]
+    lo = np.percentile(valid, 2.0)
+    hi = np.percentile(valid, 98.0)
+    if hi <= lo:
+        lo = float(valid.min())
+        hi = float(valid.max()) + 1e-6
+
+    depth_clip = np.clip(depth, lo, hi)
+    depth_norm = ((depth_clip - lo) / (hi - lo + 1e-6) * 255.0).astype(np.uint8)
+    return cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+
+
+def _empty_panel(panel_size, title):
+    panel = np.zeros((panel_size[1], panel_size[0], 3), dtype=np.uint8)
+    cv2.putText(
+        panel,
+        title,
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
+    return panel
+
+
+def _build_info_panel(panel_size, view_name, frame_stem, frame_idx, total_frames, step_mode):
+    panel = np.zeros((panel_size[1], panel_size[0], 3), dtype=np.uint8)
+    lines = [
+        f"View: {view_name}",
+        f"Frame: {frame_stem}",
+        f"Index: {frame_idx + 1}/{total_frames}",
+        "",
+    ]
+    if step_mode:
+        lines.extend(
+            [
+                "Step controls:",
+                "Space/d: next",
+                "a: prev",
+                "n: next view",
+                "q: quit",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Autoplay controls:",
+                "n: next view",
+                "q: quit",
+            ]
+        )
+
+    y = 28
+    for line in lines:
+        cv2.putText(
+            panel,
+            line,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (220, 220, 220),
+            1,
+        )
+        y += 26
+
+    return panel
 
 
 if __name__ == "__main__":
