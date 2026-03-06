@@ -2,9 +2,9 @@ import logging
 import json
 import numpy as np
 from pathlib import Path
-from unrealzoo.core.generator import SceneGenerator
-from unrealzoo.core.director import Director
-from unrealzoo.core.recorder import MultiViewRecorder
+from data4d.core.generator import SceneGenerator
+from data4d.core.director import Director
+from data4d.core.recorder import MultiViewRecorder
 
 
 class Pipeline:

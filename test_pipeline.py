@@ -4,12 +4,12 @@ import time
 import os
 import numpy as np
 from gym_unrealcv.envs.wrappers import configUE
-from unrealzoo.core.director import Director
-from unrealzoo.core.recorder import MultiViewRecorder
-from unrealzoo.utils.ground_detection import load_safe_spawns, get_random_safe_spawn
+from data4d.core.director import Director
+from data4d.core.recorder import MultiViewRecorder
+from data4d.utils.ground_detection import load_safe_spawns, get_random_safe_spawn
 
 
-def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
+def test_pipeline(env_id="UnrealAgent-MiddleEast-ContinuousColor-v0"):
     # ===== CONFIGURATION =====
     NUM_ACTORS = 5
     NUM_STATIC_CAMERAS = 5

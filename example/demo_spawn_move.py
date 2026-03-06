@@ -7,7 +7,7 @@ import numpy as np
 def demo_spawn_and_move():
     # Initialize the environment
     # using a simple environment ID from the examples
-    env_id = "UnrealAgent-Greek_Island-ContinuousColor-v0"
+    env_id = "UnrealAgent-MiddleEast-ContinuousColor-v0"
     env = gym.make(env_id)
     env.reset()
 

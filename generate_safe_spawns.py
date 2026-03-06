@@ -11,7 +11,7 @@ Usage:
 import gym
 import gym_unrealcv
 import argparse
-from unrealzoo.utils.ground_detection import generate_safe_spawn_grid
+from data4d.utils.ground_detection import generate_safe_spawn_grid
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
     parser.add_argument(
         "--env",
         type=str,
-        default="UnrealAgent-Greek_Island-ContinuousColor-v0",
+        default="UnrealAgent-MiddleEast-ContinuousColor-v0",
         help="Environment ID",
     )
     parser.add_argument(

@@ -12,7 +12,7 @@ import gym
 import gym_unrealcv
 import numpy as np
 from pathlib import Path
-from unrealzoo.core.pipeline import Pipeline
+from data4d.core.pipeline import Pipeline
 import json
 import multiprocessing as mp
 from typing import List, Dict
@@ -227,7 +227,7 @@ def main():
     }
 
     # Batch generation settings
-    env_id = "UnrealAgent-Greek_Island-ContinuousColor-v0"
+    env_id = "UnrealAgent-MiddleEast-ContinuousColor-v0"
     output_root = "./output/batch_4d"
     num_sequences = 10
     num_workers = 1  # Increase for parallel generation (requires multiple UE instances)

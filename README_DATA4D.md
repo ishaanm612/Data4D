@@ -44,7 +44,7 @@ Core modules:
 ### A) Generate safe spawns (once per map or when needed)
 
 ```bash
-python generate_safe_spawns.py --env UnrealAgent-Greek_Island-ContinuousColor-v0
+python generate_safe_spawns.py --env UnrealAgent-MiddleEast-ContinuousColor-v0
 ```
 
 ### B) Run the practical recorder loop

@@ -27,8 +27,8 @@ import gym
 import gym_unrealcv
 import numpy as np
 from pathlib import Path
-from unrealzoo.core.pipeline import Pipeline
-from unrealzoo.utils.ground_detection import load_safe_spawns
+from data4d.core.pipeline import Pipeline
+from data4d.utils.ground_detection import load_safe_spawns
 
 
 def create_pipeline_config(env_id, output_dir, safe_spawns):
@@ -165,7 +165,7 @@ def create_pipeline_config(env_id, output_dir, safe_spawns):
 
 def main():
     # Configuration
-    env_id = "UnrealAgent-Greek_Island-ContinuousColor-v0"
+    env_id = "UnrealAgent-MiddleEast-ContinuousColor-v0"
     output_dir = "./output/4d_demo"
 
     print("=" * 60)

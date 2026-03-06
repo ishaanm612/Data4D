@@ -3,3 +3,6 @@ __MACOSX/
 build/
 *.egg-info/
 **/demo_output_60fps/
+UnrealEnv/
+.envrc
+unrealzoo-gym

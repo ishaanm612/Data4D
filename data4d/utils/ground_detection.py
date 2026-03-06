@@ -333,7 +333,7 @@ if __name__ == "__main__":
     print("=== Ground Detection Utility ===")
     print("Initializing UnrealZoo environment...")
 
-    env = gym.make("UnrealAgent-Greek_Island-ContinuousColor-v0")
+    env = gym.make("UnrealAgent-MiddleEast-ContinuousColor-v0")
     env.reset()
     client = env.unwrapped.unrealcv
 
