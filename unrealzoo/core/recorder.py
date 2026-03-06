@@ -3,6 +3,7 @@ import os
 import json
 import numpy as np
 import time
+import re
 from pathlib import Path
 import io
 import cv2
@@ -54,6 +55,18 @@ class MultiViewRecorder:
             0.35  # 0=snap, 1=no movement; ~0.35 gives smooth tracking
         )
         self._camera_settle_delay = 0.02  # Per-view: wait after positioning before capture
+        self._pose_actor_ids = []
+        self._capture_canonical_mesh = False
+        self._capture_joints_per_frame = False
+        self._requested_joint_names = None
+        self._joint_names_cache = {}
+        self._canonical_mesh_cache = {}
+        self._pose_warning_once = set()
+        self._pose_logging = False
+        self._pose_log_each_joint = False
+        self._pose_log_joint_interval = 10
+        self._pose_slow_request_warn_s = 0.75
+        self._fail_on_joint_capture_error = False
 
         # Create directory structure
         self._init_directories()
@@ -296,7 +309,505 @@ class MultiViewRecorder:
         self.frame_idx = 0
         self._last_pov_rot = {}
         self._last_follow_state = {}
+        self._joint_names_cache = {}
+        self._canonical_mesh_cache = {}
+        self._pose_warning_once = set()
         self.logger.info("Recorder reset")
+
+    def configure_pose_capture(
+        self,
+        actor_ids,
+        save_canonical_mesh=True,
+        save_joints_per_frame=True,
+        joint_names=None,
+        verbose_logging=False,
+        log_each_joint=False,
+        log_joint_interval=10,
+        slow_request_warn_s=0.75,
+        fail_on_joint_capture_error=False,
+    ):
+        """
+        Configure actor pose recording.
+
+        Args:
+            actor_ids: Iterable of actor ids to record.
+            save_canonical_mesh: Save one canonical mesh (.npy) per actor.
+            save_joints_per_frame: Save joints for each frame if API is available.
+            joint_names: Optional list of joint names. If None, auto-discover.
+            verbose_logging: Emit detailed pose capture logs.
+            log_each_joint: Log each joint fetch request (very verbose).
+            log_joint_interval: Progress logging interval when not logging each joint.
+            slow_request_warn_s: Warn if a single pose request exceeds this duration.
+            fail_on_joint_capture_error: If True, raise RuntimeError when joint
+                names or joint positions cannot be captured.
+        """
+        self._pose_actor_ids = list(dict.fromkeys(actor_ids or []))
+        self._capture_canonical_mesh = bool(save_canonical_mesh)
+        self._capture_joints_per_frame = bool(save_joints_per_frame)
+        self._requested_joint_names = list(joint_names) if joint_names else None
+        self._pose_logging = bool(verbose_logging)
+        self._pose_log_each_joint = bool(log_each_joint)
+        self._pose_log_joint_interval = max(1, int(log_joint_interval))
+        self._pose_slow_request_warn_s = float(slow_request_warn_s)
+        self._fail_on_joint_capture_error = bool(fail_on_joint_capture_error)
+        self.logger.info(
+            "Pose capture configured | actors=%d, canonical_mesh=%s, joints_per_frame=%s, "
+            "verbose=%s, each_joint=%s, joint_interval=%d, slow_warn=%.2fs, fail_on_joint_error=%s",
+            len(self._pose_actor_ids),
+            self._capture_canonical_mesh,
+            self._capture_joints_per_frame,
+            self._pose_logging,
+            self._pose_log_each_joint,
+            self._pose_log_joint_interval,
+            self._pose_slow_request_warn_s,
+            self._fail_on_joint_capture_error,
+        )
+
+    def _pose_log(self, message, *args):
+        if self._pose_logging:
+            self.logger.info(message, *args)
+
+    def _pose_request(self, cmd, context=None):
+        t0 = time.time()
+        if context and self._pose_logging:
+            self.logger.info("[pose] request start | %s | cmd=%s", context, cmd)
+        response = self.unreal.client.request(cmd)
+        elapsed = time.time() - t0
+        if context and self._pose_logging:
+            self.logger.info("[pose] request done  | %s | %.3fs", context, elapsed)
+        elif elapsed > self._pose_slow_request_warn_s:
+            self.logger.warning(
+                "[pose] slow request | %.3fs | cmd=%s",
+                elapsed,
+                cmd,
+            )
+        return response
+
+    def _warn_once(self, key, message):
+        if key in self._pose_warning_once:
+            return
+        self._pose_warning_once.add(key)
+        self.logger.warning(message)
+
+    def _response_preview(self, response, limit=140):
+        if response is None:
+            return "None"
+        if isinstance(response, bytes):
+            response = response.decode("utf-8", errors="ignore")
+        text = str(response).replace("\n", "\\n")
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    def _decode_vector3(self, response):
+        if response is None:
+            return None
+        if isinstance(response, bytes):
+            try:
+                response = response.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+        if not isinstance(response, str):
+            return None
+        if response == "error" or response.startswith("error"):
+            return None
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", response)
+        if len(nums) < 3:
+            return None
+        try:
+            return [float(nums[0]), float(nums[1]), float(nums[2])]
+        except ValueError:
+            return None
+
+    def _get_actor_transform(self, actor_id):
+        loc = self._decode_vector3(
+            self._pose_request(
+                f"vget /object/{actor_id}/location", context=f"{actor_id} transform/location"
+            )
+        )
+        rot = self._decode_vector3(
+            self._pose_request(
+                f"vget /object/{actor_id}/rotation", context=f"{actor_id} transform/rotation"
+            )
+        )
+        if loc is None and rot is None:
+            return None
+        return {"position": loc, "rotation": rot}
+
+    def _get_joint_names(self, actor_id, return_diagnostics=False):
+        if self._requested_joint_names:
+            joint_names = self._requested_joint_names
+            if return_diagnostics:
+                return joint_names, "using explicit joint_names from config"
+            return joint_names
+        if actor_id in self._joint_names_cache:
+            joint_names = self._joint_names_cache[actor_id]
+            if return_diagnostics:
+                return joint_names, "using cached joint names"
+            return joint_names
+
+        candidates = [
+            f"vget /object/{actor_id}/bones",
+            f"vget /object/{actor_id}/bone_names",
+            f"vbp {actor_id} get_bones",
+            f"vbp {actor_id} get_bone_names",
+        ]
+        joint_names = []
+        diagnostics = []
+        for cmd in candidates:
+            try:
+                response = self._pose_request(
+                    cmd, context=f"{actor_id} discover_joint_names"
+                )
+            except Exception as exc:
+                diagnostics.append(f"{cmd} => EXCEPTION({exc})")
+                continue
+            diagnostics.append(f"{cmd} => {self._response_preview(response)}")
+            if response is None:
+                continue
+            if isinstance(response, bytes):
+                response = response.decode("utf-8", errors="ignore")
+            if not isinstance(response, str):
+                continue
+            if response == "error" or response.startswith("error"):
+                continue
+            try:
+                parsed = json.loads(response)
+                if isinstance(parsed, list):
+                    joint_names = [str(v) for v in parsed if str(v)]
+                elif isinstance(parsed, dict):
+                    for key in ("bones", "bone_names", "joints"):
+                        val = parsed.get(key)
+                        if isinstance(val, list):
+                            joint_names = [str(v) for v in val if str(v)]
+                            break
+            except json.JSONDecodeError:
+                tokens = [
+                    t.strip()
+                    for t in re.split(r"[\s,\n\r\t]+", response)
+                    if t.strip()
+                ]
+                joint_names = tokens
+
+            if joint_names:
+                break
+
+        self._joint_names_cache[actor_id] = joint_names
+        if not joint_names:
+            self._warn_once(
+                f"joint_names_{actor_id}",
+                f"[pose] Could not discover joint names for actor '{actor_id}'. "
+                "Joint capture will be skipped for this actor.",
+            )
+        diagnostics_text = " | ".join(diagnostics) if diagnostics else "no joint-name commands attempted"
+        if return_diagnostics:
+            return joint_names, diagnostics_text
+        return joint_names
+
+    def _get_joint_position(self, actor_id, joint_name, return_diagnostics=False):
+        candidates = [
+            f"vget /object/{actor_id}/bone/{joint_name}/location",
+            f"vget /object/{actor_id}/bone_location {joint_name}",
+            f"vbp {actor_id} get_bone_location {joint_name}",
+            f"vbp {actor_id} get_joint_location {joint_name}",
+        ]
+        diagnostics = []
+        for idx, cmd in enumerate(candidates):
+            try:
+                context = None
+                if self._pose_log_each_joint:
+                    context = f"{actor_id} joint={joint_name} candidate={idx + 1}/{len(candidates)}"
+                response = self._pose_request(cmd, context=context)
+            except Exception as exc:
+                diagnostics.append(f"{cmd} => EXCEPTION({exc})")
+                continue
+            diagnostics.append(f"{cmd} => {self._response_preview(response)}")
+            vector = self._decode_vector3(response)
+            if vector is not None:
+                if return_diagnostics:
+                    return vector, " | ".join(diagnostics)
+                return vector
+        diagnostics_text = " | ".join(diagnostics) if diagnostics else "no joint-position commands attempted"
+        if return_diagnostics:
+            return None, diagnostics_text
+        return None
+
+    def _normalize_vertex_rows(self, vertices):
+        if vertices is None:
+            return None, 0, 0
+
+        # Handle flat list/array: [x1, y1, z1, x2, y2, z2, ...]
+        if isinstance(vertices, np.ndarray):
+            vertices = vertices.tolist()
+        if isinstance(vertices, (list, tuple)) and vertices:
+            first = vertices[0]
+            if not isinstance(first, (list, tuple, np.ndarray, str, dict)):
+                floats = []
+                for v in vertices:
+                    try:
+                        floats.append(float(v))
+                    except (TypeError, ValueError):
+                        continue
+                usable = (len(floats) // 3) * 3
+                if usable <= 0:
+                    return None, len(vertices), len(vertices)
+                arr = np.asarray(floats[:usable], dtype=np.float32).reshape(-1, 3)
+                dropped = len(vertices) - usable
+                return arr, dropped, len(vertices)
+
+        if isinstance(vertices, str):
+            items = vertices.splitlines()
+        else:
+            items = list(vertices)
+
+        rows = []
+        dropped = 0
+        total = len(items)
+        for item in items:
+            xyz = None
+
+            if isinstance(item, np.ndarray):
+                item = item.tolist()
+
+            if isinstance(item, dict):
+                if all(k in item for k in ("x", "y", "z")):
+                    try:
+                        xyz = [float(item["x"]), float(item["y"]), float(item["z"])]
+                    except (TypeError, ValueError):
+                        xyz = None
+                else:
+                    # Try common uppercase keys
+                    if all(k in item for k in ("X", "Y", "Z")):
+                        try:
+                            xyz = [float(item["X"]), float(item["Y"]), float(item["Z"])]
+                        except (TypeError, ValueError):
+                            xyz = None
+            elif isinstance(item, (list, tuple)):
+                vals = []
+                for val in item:
+                    try:
+                        vals.append(float(val))
+                    except (TypeError, ValueError):
+                        continue
+                if len(vals) >= 3:
+                    xyz = vals[:3]
+            else:
+                if isinstance(item, bytes):
+                    item = item.decode("utf-8", errors="ignore")
+                if isinstance(item, str):
+                    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", item)
+                    if len(nums) >= 3:
+                        try:
+                            xyz = [float(nums[0]), float(nums[1]), float(nums[2])]
+                        except ValueError:
+                            xyz = None
+
+            if xyz is None:
+                dropped += 1
+                continue
+            rows.append(xyz)
+
+        if not rows:
+            return None, dropped, total
+        return np.asarray(rows, dtype=np.float32), dropped, total
+
+    def _save_canonical_mesh_once(self, actor_id):
+        if actor_id in self._canonical_mesh_cache:
+            self._pose_log("[pose] actor=%s canonical mesh cached", actor_id)
+            return self._canonical_mesh_cache[actor_id]
+
+        cmd = f"vget /object/{actor_id}/vertex_location"
+        try:
+            self._pose_log("[pose] actor=%s canonical mesh request", actor_id)
+            vertices = self._pose_request(cmd, context=f"{actor_id} canonical_mesh")
+        except Exception as exc:
+            self._warn_once(
+                f"canonical_mesh_{actor_id}",
+                f"[pose] Failed canonical mesh for actor '{actor_id}': {exc}",
+            )
+            return None
+
+        if not vertices:
+            self._warn_once(
+                f"empty_mesh_{actor_id}",
+                f"[pose] Empty canonical mesh for actor '{actor_id}'.",
+            )
+            return None
+
+        mesh_array, dropped_rows, total_rows = self._normalize_vertex_rows(vertices)
+        if mesh_array is None or mesh_array.size == 0:
+            self._warn_once(
+                f"invalid_mesh_{actor_id}",
+                f"[pose] Canonical mesh payload for actor '{actor_id}' could not be parsed.",
+            )
+            return None
+        if dropped_rows > 0:
+            self._warn_once(
+                f"ragged_mesh_{actor_id}",
+                f"[pose] Canonical mesh for actor '{actor_id}' had {dropped_rows}/{total_rows} "
+                "invalid rows; saved only valid 3D vertices.",
+            )
+
+        mesh_dir = self.output_dir / "poses" / "canonical_mesh"
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        mesh_path = mesh_dir / f"{actor_id}.npy"
+        np.save(mesh_path, mesh_array)
+
+        rel_path = str(mesh_path.relative_to(self.output_dir))
+        mesh_meta = {
+            "path": rel_path,
+            "vertex_count": int(mesh_array.shape[0]),
+            "frame_captured": self.frame_idx,
+            "coord_frame": "world",
+        }
+        self._pose_log(
+            "[pose] actor=%s canonical mesh saved | vertices=%d | path=%s",
+            actor_id,
+            mesh_meta["vertex_count"],
+            rel_path,
+        )
+        self._canonical_mesh_cache[actor_id] = mesh_meta
+        return mesh_meta
+
+    def _save_pose_frame(self, frame_timestamp):
+        t_frame0 = time.time()
+        actor_ids = list(self._pose_actor_ids)
+        if not actor_ids:
+            actor_ids = list(
+                dict.fromkeys(
+                    [v.get("actor_id") for v in self.views if v.get("actor_id")]
+                )
+            )
+        if not actor_ids:
+            return None
+        self._pose_log(
+            "[pose] frame=%06d start | actors=%d",
+            self.frame_idx,
+            len(actor_ids),
+        )
+
+        pose_frame = {
+            "frame_idx": self.frame_idx,
+            "timestamp": frame_timestamp,
+            "actors": {},
+        }
+
+        for actor_id in actor_ids:
+            t_actor0 = time.time()
+            actor_pose = {}
+            self._pose_log("[pose] frame=%06d actor=%s start", self.frame_idx, actor_id)
+
+            transform = self._get_actor_transform(actor_id)
+            if transform is not None:
+                actor_pose["transform"] = transform
+                self._pose_log(
+                    "[pose] frame=%06d actor=%s transform captured",
+                    self.frame_idx,
+                    actor_id,
+                )
+
+            if self._capture_canonical_mesh:
+                mesh_meta = self._save_canonical_mesh_once(actor_id)
+                if mesh_meta is not None:
+                    actor_pose["canonical_mesh"] = mesh_meta
+
+            if self._capture_joints_per_frame:
+                joint_names, joint_name_diag = self._get_joint_names(
+                    actor_id, return_diagnostics=True
+                )
+                if joint_names:
+                    self._pose_log(
+                        "[pose] frame=%06d actor=%s joints discovered=%d",
+                        self.frame_idx,
+                        actor_id,
+                        len(joint_names),
+                    )
+                    joints = {}
+                    total_joints = len(joint_names)
+                    for joint_idx, joint_name in enumerate(joint_names, start=1):
+                        if (
+                            self._pose_log_each_joint
+                            or joint_idx == 1
+                            or joint_idx == total_joints
+                            or joint_idx % self._pose_log_joint_interval == 0
+                        ):
+                            self._pose_log(
+                                "[pose] frame=%06d actor=%s joint_progress=%d/%d current=%s",
+                                self.frame_idx,
+                                actor_id,
+                                joint_idx,
+                                total_joints,
+                                joint_name,
+                            )
+                        t_joint0 = time.time()
+                        position, joint_diag = self._get_joint_position(
+                            actor_id, joint_name, return_diagnostics=True
+                        )
+                        joint_elapsed = time.time() - t_joint0
+                        if joint_elapsed > self._pose_slow_request_warn_s:
+                            self.logger.warning(
+                                "[pose] slow joint fetch | frame=%06d actor=%s joint=%s "
+                                "elapsed=%.3fs",
+                                self.frame_idx,
+                                actor_id,
+                                joint_name,
+                                joint_elapsed,
+                            )
+                        if position is not None:
+                            joints[joint_name] = position
+                        elif self._fail_on_joint_capture_error:
+                            msg = (
+                                f"[pose] Joint position capture failed | frame={self.frame_idx:06d} "
+                                f"actor={actor_id} joint={joint_name} | attempts: {joint_diag}"
+                            )
+                            self.logger.error(msg)
+                            raise RuntimeError(msg)
+                    if joints:
+                        actor_pose["joints"] = {
+                            "coord_frame": "world",
+                            "count": len(joints),
+                            "positions": joints,
+                        }
+                    else:
+                        self._warn_once(
+                            f"joint_positions_{actor_id}",
+                            f"[pose] No joint positions returned for actor '{actor_id}'.",
+                        )
+                elif self._fail_on_joint_capture_error:
+                    msg = (
+                        f"[pose] Joint name discovery failed | frame={self.frame_idx:06d} "
+                        f"actor={actor_id} | attempts: {joint_name_diag}"
+                    )
+                    self.logger.error(msg)
+                    raise RuntimeError(msg)
+
+            if actor_pose:
+                pose_frame["actors"][actor_id] = actor_pose
+                n_joints = actor_pose.get("joints", {}).get("count", 0)
+                self._pose_log(
+                    "[pose] frame=%06d actor=%s done | joints=%d | elapsed=%.3fs",
+                    self.frame_idx,
+                    actor_id,
+                    n_joints,
+                    time.time() - t_actor0,
+                )
+
+        if not pose_frame["actors"]:
+            self._pose_log("[pose] frame=%06d no actor pose data saved", self.frame_idx)
+            return None
+
+        pose_path = self.output_dir / "poses" / f"frame_{self.frame_idx:06d}.json"
+        pose_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(pose_path, "w") as f:
+            json.dump(pose_frame, f, indent=2)
+        self._pose_log(
+            "[pose] frame=%06d saved | actors=%d | elapsed=%.3fs | path=%s",
+            self.frame_idx,
+            len(pose_frame["actors"]),
+            time.time() - t_frame0,
+            str(pose_path.relative_to(self.output_dir)),
+        )
+        return str(pose_path.relative_to(self.output_dir))
 
     # =================================================================
     # Legacy API for backward compatibility with test_pipeline.py
@@ -758,6 +1269,10 @@ class MultiViewRecorder:
                 self.logger.warning(f"Failed to capture from view {view['id']}: {e}")
 
         # Save scene-level frame index (frame_idx, timestamp, camera list)
+        pose_relpath = self._save_pose_frame(frame_meta["timestamp"])
+        if pose_relpath:
+            frame_meta["poses"] = pose_relpath
+
         frame_meta_path = (
             self.output_dir / "scene_metadata" / f"frame_{self.frame_idx:06d}.json"
         )

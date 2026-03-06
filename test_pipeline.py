@@ -15,6 +15,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
     NUM_STATIC_CAMERAS = 5
     ACTOR_SPREAD_RADIUS = 2000  # How far apart actors spawn
     CAMERA_OFFSET_RANGE = 500  # Random offset range for static cameras from actors
+    NAV_LOOP = 1  # 0: one-shot random target, 1: continuous random wandering
     # Use 1280x720 to avoid reset hang; Full HD (1920x1080) can stall during init observation
     WINDOW_RESOLUTION = (1280, 720)
     # =========================
@@ -44,7 +45,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
 
     # Init Components
     print("Initializing Director and Recorder...")
-    director = Director(client)
+    director = Director(client, nav_loop=NAV_LOOP)
     # skip_depth=True: depth capture often hangs with UnrealCV; RGB/mask still captured
     recorder = MultiViewRecorder(client, output_dir=session_dir, skip_depth=False)
 
@@ -92,6 +93,15 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
     print("Registering actors for NavMesh movement...")
     for actor in spawned:
         director.register_background_actor(actor)
+
+    # Save one canonical mesh per actor + per-frame joints/poses (if supported by UnrealCV/UE plugin)
+    recorder.configure_pose_capture(
+        actor_ids=spawned,
+        save_canonical_mesh=True,
+        save_joints_per_frame=True,
+        joint_names=None,  # auto-discover if the backend exposes joint names
+        fail_on_joint_capture_error=True,
+    )
 
     # Position camera 0 (viewport) near first actor for observation (one-time setup)
     print("Positioning viewport camera near first actor...")
@@ -161,7 +171,7 @@ def test_pipeline(env_id="UnrealAgent-Greek_Island-ContinuousColor-v0"):
         )
 
     # 4. Run Loop (600 Frames at 30 FPS)
-    target_frames = 150
+    target_frames = 30
     dt = 1.0 / 30.0
 
     print(f"Starting Recording for {target_frames} frames at 30 FPS...")

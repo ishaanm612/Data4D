@@ -9,7 +9,7 @@ class Director:
     and stochastic background movements.
     """
 
-    def __init__(self, unreal_client, nav_interval=3.0):
+    def __init__(self, unreal_client, nav_interval=3.0, nav_loop=0):
         self.client = unreal_client
         self.logger = logging.getLogger(__name__)
         self.scheduled_events = []  # List of dicts with {time, actor, type, params}
@@ -19,6 +19,8 @@ class Director:
         # Track last navigation command time for NavMesh
         self.last_nav_time = {}  # {actor_name: last_time}
         self.nav_interval = nav_interval  # Seconds between nav_random; longer = smoother, less disjointed motion
+        self.nav_loop = nav_loop  # 0: one-shot random goal, 1: continuous random wandering
+        self._continuous_nav_started = {}  # {actor_name: bool}
 
     def register_background_actor(self, actor_name):
         """
@@ -29,6 +31,7 @@ class Director:
             self.last_nav_time[actor_name] = (
                 -10.0
             )  # Initialize to allow immediate first command
+            self._continuous_nav_started[actor_name] = False
             self.logger.info(f"Registered background actor: {actor_name}")
 
     def schedule_action(self, timestamp, actor, action_type, params):
@@ -105,28 +108,47 @@ class Director:
     def update_background_actors(self, dt):
         """
         Stochastic updates for background actors using NavMesh.
-        Sends nav_random commands periodically (nav_interval seconds).
+        Sends nav_random commands periodically when loop=0.
+        When loop=1 (continuous mode), sends nav_random once per actor and lets
+        the engine keep updating targets internally.
         """
         for actor in self.background_actors:
-            # Check if enough time has passed since last navigation command
-            if (
-                self.current_time - self.last_nav_time.get(actor, -10)
-                >= self.nav_interval
-            ):
-                # Send new navigation command
-                radius = 2500  # Random navigation radius
-                try:
-                    if hasattr(self.client, "nav_random"):
-                        self.client.nav_random(actor, radius, 0)  # loop=0 implies once
-                    else:
-                        self.client.client.request(f"vbp {actor} nav_random {radius}")
-                    self.last_nav_time[actor] = self.current_time
-                except Exception as e:
-                    self.logger.warning(f"Failed to send nav_random to {actor}: {e}")
+            continuous_mode = bool(self.nav_loop)
+            should_send = False
+
+            if continuous_mode:
+                # In continuous mode, issue nav_random only once.
+                should_send = not self._continuous_nav_started.get(actor, False)
+            else:
+                # In one-shot mode, re-issue periodically.
+                should_send = (
+                    self.current_time - self.last_nav_time.get(actor, -10)
+                    >= self.nav_interval
+                )
+
+            if not should_send:
+                continue
+
+            radius = 2500  # Random navigation radius
+            try:
+                if hasattr(self.client, "nav_random"):
+                    self.client.nav_random(actor, radius, self.nav_loop)
+                else:
+                    self.client.client.request(
+                        f"vbp {actor} nav_random {radius} {self.nav_loop}"
+                    )
+                self.last_nav_time[actor] = self.current_time
+                if continuous_mode:
+                    self._continuous_nav_started[actor] = True
+            except Exception as e:
+                self.logger.warning(f"Failed to send nav_random to {actor}: {e}")
 
     def reset(self):
         self.current_time = 0.0
         self.scheduled_events = []
         self.last_nav_time = {actor: -10.0 for actor in self.background_actors}
+        self._continuous_nav_started = {
+            actor: False for actor in self.background_actors
+        }
         if hasattr(self, "actor_movement"):
             self.actor_movement = {}

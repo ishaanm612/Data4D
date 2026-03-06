@@ -392,12 +392,14 @@ class Character_API(UnrealCv_API):
         return res
 
     def nav_to_random(
-        self, obj, radius, loop
+        self, obj, radius, loop=None
     ):  # navigate the agent to a random location
         # Agent randomly selects a point within its own radius range for navigation.
         # The loop parameter controls whether continuous navigation is performed.（True for continuous navigation).
         # Return with the randomly sampled location.
-        cmd = f"vbp {obj} nav_random {radius} {loop}"
+        cmd = f"vbp {obj} nav_random {radius}"
+        if loop is not None:
+            cmd = f"{cmd} {loop}"
         res = self.client.request(cmd)
         return res
 
@@ -410,12 +412,14 @@ class Character_API(UnrealCv_API):
         return res
 
     def nav_random(
-        self, player, radius, loop
+        self, player, radius, loop=None
     ):  # navigate the agent to a random location
         # Agent randomly selects a point within its own radius range for navigation.
         # The loop parameter controls whether continuous navigation is performed.（True for continuous navigation).
         # Return with the randomly sampled location.
-        cmd = f"vbp {player} nav_random {radius} {loop}"
+        cmd = f"vbp {player} nav_random {radius}"
+        if loop is not None:
+            cmd = f"{cmd} {loop}"
         res = self.client.request(cmd)
         return self.decoder.string2vector(res)
 
